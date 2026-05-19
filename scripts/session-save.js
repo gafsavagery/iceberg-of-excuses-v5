@@ -1,0 +1,425 @@
+// ===================================================================
+// SESSION SAVE
+// ===================================================================
+// Two-part system:
+//
+// 1. AUTO-SAVE — writes session state to localStorage on significant
+//    events (concession Yes, scoop deployed, named fear, aha marked).
+//    Survives tab close. Auto-restored on page load.
+//
+// 2. MANUAL EXPORT — generates a detailed .md file and triggers the
+//    browser's download flow. On iOS, this opens the Files save sheet.
+//    The user picks a folder once; iOS remembers for next time.
+//
+// Storage key: 'iceberg-v5-session'
+// MD filename: 'gaf-drill-YYYY-MM-DD-HHMM.md'
+// ===================================================================
+
+const SessionSave = (function() {
+
+  const STORAGE_KEY = 'iceberg-v5-session';
+  const HISTORY_KEY = 'iceberg-v5-history';
+
+  // -----------------------------------------------------------------
+  // AUTO-SAVE TO LOCALSTORAGE
+  // -----------------------------------------------------------------
+
+  function autoSave(sessionState, drillState) {
+    try {
+      const session = sessionState.get();
+      if (!session) return;
+      // Build a complete restorable snapshot
+      const snapshot = {
+        savedAt: new Date().toISOString(),
+        session: session,
+        drillCardLog: drillState && drillState.getState() ? {
+          chipId: drillState.getState().chip ? drillState.getState().chip.id : null,
+          choices: drillState.getState().choices,
+          stage: drillState.getState().stage,
+          cardLog: drillState.getState().cards.map(c => ({
+            type: c.type,
+            data: simplifyCardData(c.data),
+            timestamp: c.timestamp
+          }))
+        } : null
+      };
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(snapshot));
+    } catch (err) {
+      console.warn('SessionSave.autoSave failed:', err);
+    }
+  }
+
+  // Strip non-serializable / huge data from card log entries.
+  // Specifically: don't store entire parsed lexicon, just key strings.
+  function simplifyCardData(data) {
+    if (!data) return null;
+    const clean = {};
+    if (data.letter) clean.letter = data.letter;
+    if (data.path) clean.path = data.path;
+    if (data.analogy) clean.analogy = data.analogy;
+    if (data.verdict) clean.verdict = data.verdict;
+    if (data.response) {
+      clean.response = {
+        text: data.response.text,
+        sampleIndex: data.response.sampleIndex,
+        type: data.response.type
+      };
+    }
+    if (data.excuse) clean.excuse = data.excuse;
+    return clean;
+  }
+
+  function loadAutoSaved() {
+    try {
+      const raw = localStorage.getItem(STORAGE_KEY);
+      if (!raw) return null;
+      return JSON.parse(raw);
+    } catch (err) {
+      console.warn('SessionSave.loadAutoSaved failed:', err);
+      return null;
+    }
+  }
+
+  function clearAutoSaved() {
+    try {
+      localStorage.removeItem(STORAGE_KEY);
+    } catch (err) {
+      console.warn('SessionSave.clearAutoSaved failed:', err);
+    }
+  }
+
+  function hasAutoSaved() {
+    try {
+      return !!localStorage.getItem(STORAGE_KEY);
+    } catch (err) {
+      return false;
+    }
+  }
+
+  // -----------------------------------------------------------------
+  // HISTORY (keep last N completed sessions)
+  // -----------------------------------------------------------------
+
+  function archiveCompletedSession(sessionState) {
+    try {
+      const summary = sessionState.getSummary();
+      if (summary.excuseCount === 0) return; // nothing to archive
+      const raw = localStorage.getItem(HISTORY_KEY);
+      const history = raw ? JSON.parse(raw) : [];
+      history.unshift({
+        archivedAt: new Date().toISOString(),
+        summary: summary,
+        excuses: sessionState.getClearedExcuses(),
+        namedFear: sessionState.getNamedFear()
+      });
+      // Keep last 25
+      if (history.length > 25) history.length = 25;
+      localStorage.setItem(HISTORY_KEY, JSON.stringify(history));
+    } catch (err) {
+      console.warn('SessionSave.archive failed:', err);
+    }
+  }
+
+  function getHistory() {
+    try {
+      const raw = localStorage.getItem(HISTORY_KEY);
+      return raw ? JSON.parse(raw) : [];
+    } catch (err) {
+      return [];
+    }
+  }
+
+  // -----------------------------------------------------------------
+  // MANUAL MARKDOWN EXPORT
+  // -----------------------------------------------------------------
+
+  function exportAsMarkdown(sessionState, drillCardLogs) {
+    const md = buildMarkdownReport(sessionState, drillCardLogs);
+    const filename = buildFilename();
+    return triggerDownload(md, filename);
+  }
+
+  function buildFilename() {
+    const now = new Date();
+    const y = now.getFullYear();
+    const m = String(now.getMonth() + 1).padStart(2, '0');
+    const d = String(now.getDate()).padStart(2, '0');
+    const h = String(now.getHours()).padStart(2, '0');
+    const mn = String(now.getMinutes()).padStart(2, '0');
+    return `gaf-drill-${y}-${m}-${d}-${h}${mn}.md`;
+  }
+
+  // Returns { filename, size, method, error? }
+  async function triggerDownload(content, filename) {
+    const size = content.length;
+
+    // Path 1: Web Share API with file (best on iOS, opens native share sheet)
+    try {
+      if (navigator.canShare && navigator.share && typeof File !== 'undefined') {
+        const file = new File([content], filename, { type: 'text/markdown' });
+        if (navigator.canShare({ files: [file] })) {
+          await navigator.share({
+            files: [file],
+            title: 'GAF Drill Session',
+            text: 'Sales drill session export'
+          });
+          return { filename, size, method: 'share-api' };
+        }
+      }
+    } catch (err) {
+      // User may have cancelled; that's fine, fall through to download
+      if (err.name === 'AbortError') {
+        return { filename, size, method: 'share-cancelled', cancelled: true };
+      }
+      console.warn('share API failed, falling back to download:', err);
+    }
+
+    // Path 2: Classic blob download (works on desktop, sometimes mobile)
+    try {
+      const blob = new Blob([content], { type: 'text/markdown;charset=utf-8' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = filename;
+      a.rel = 'noopener';
+      a.target = '_blank';
+      document.body.appendChild(a);
+      a.click();
+      setTimeout(() => {
+        if (a.parentNode) document.body.removeChild(a);
+        URL.revokeObjectURL(url);
+      }, 1500);
+      return { filename, size, method: 'blob-download' };
+    } catch (err) {
+      console.error('blob download failed:', err);
+    }
+
+    // Path 3: Open in new tab as data URI (last resort — user copies & saves manually)
+    try {
+      const dataUri = 'data:text/markdown;charset=utf-8,' + encodeURIComponent(content);
+      window.open(dataUri, '_blank');
+      return { filename, size, method: 'data-uri-fallback' };
+    } catch (err) {
+      console.error('all save methods failed:', err);
+      return { filename, size, method: 'failed', error: err.message };
+    }
+  }
+
+  function buildMarkdownReport(sessionState, drillCardLogs) {
+    const summary = sessionState.getSummary();
+    const excuses = sessionState.getClearedExcuses();
+    const namedFear = sessionState.getNamedFear();
+    const ahaType = sessionState.getAhaType();
+    const now = new Date();
+    const dateStr = now.toISOString().substring(0, 10);
+
+    const lines = [];
+    const session = sessionState.get();
+    const persona = session && session.persona ? session.persona : null;
+    const mode = session ? (session.mode || 'lexicon') : 'lexicon';
+    const aiPlays = session ? (session.aiPlays || 'prospect') : 'prospect';
+
+    lines.push(`# Drill Session — ${dateStr}`);
+    lines.push('');
+    lines.push(`**Generated by:** Iceberg of Excuses v7`);
+    lines.push(`**Saved at:** ${now.toLocaleString()}`);
+    lines.push(`**Mode:** ${mode === 'ai' ? 'AI prospect' : 'Lexicon (pre-written samples)'}`);
+    if (mode === 'ai') {
+      lines.push(`**AI played:** ${aiPlays === 'closer' ? 'the closer (you were the prospect)' : 'the prospect (you were the closer)'}`);
+    }
+    lines.push('');
+    lines.push('---');
+    lines.push('');
+
+    // ===== HIGH-LEVEL SUMMARY =====
+    lines.push('## Call summary');
+    lines.push('');
+    lines.push(`- **Prospect type:** ${summary.prospectType}`);
+    lines.push(`- **Duration:** ${summary.durationMin} min`);
+    lines.push(`- **Externals cleared:** ${summary.excuseLabels.join(', ') || '(none)'}`);
+    lines.push(`- **Scoop deployed:** ${summary.scoopDeployed ? 'Yes' : 'No'}` + (summary.scoopOverride ? ' (override used)' : ''));
+    lines.push(`- **Named fear:** ${summary.namedFear || '(not yet reached)'}`);
+    lines.push(`- **Aha type:** ${summary.ahaType || '(not yet marked)'}`);
+    // AI cost if applicable
+    if (mode === 'ai' && typeof AIEngine !== 'undefined') {
+      lines.push(`- **AI session cost:** $${AIEngine.getSessionCost().toFixed(4)}`);
+    }
+    // Conversation turn count if applicable
+    if (typeof ConversationHistory !== 'undefined' && ConversationHistory.getLength() > 0) {
+      const visible = ConversationHistory.getAll().filter(t => !(t.meta && t.meta.hidden)).length;
+      lines.push(`- **Conversation turns:** ${visible}`);
+    }
+    lines.push('');
+    lines.push('---');
+    lines.push('');
+
+    // ===== PER-DRILL DETAIL =====
+    lines.push('## Per-drill detail');
+    lines.push('');
+
+    if (excuses.length === 0) {
+      lines.push('*(No excuses cleared yet.)*');
+      lines.push('');
+    } else {
+      excuses.forEach((ex, idx) => {
+        lines.push(`### Drill ${idx + 1} — ${ex.chipLabel}`);
+        lines.push('');
+        lines.push(`- **Concession:** ${ex.concession === 'yes' ? '✓ Yes' : ex.concession}`);
+        if (ex.pathLabel) lines.push(`- **Path diagnosed:** ${ex.pathLabel}`);
+        if (ex.analogyNumber) lines.push(`- **Analogy used:** #${ex.analogyNumber}`);
+
+        // Pull more detail from drillCardLogs if available
+        const log = drillCardLogs && drillCardLogs[ex.chipId];
+        if (log) {
+          // SCRIPT letters deployed
+          const scriptLetters = log
+            .filter(c => c.type === 'script-question')
+            .map(c => c.data && c.data.letter)
+            .filter(Boolean);
+          if (scriptLetters.length) {
+            lines.push(`- **SCRIPT letters deployed:** ${scriptLetters.join(', ')}`);
+          }
+          // Prospect responses heard
+          const responses = log
+            .filter(c => c.type === 'prospect-response')
+            .map(c => c.data && c.data.response && c.data.response.text)
+            .filter(Boolean);
+          if (responses.length) {
+            lines.push('');
+            lines.push('**Prospect responses (verbatim):**');
+            responses.forEach(r => lines.push(`  > "${r}"`));
+          }
+        }
+        lines.push('');
+        lines.push(`- **Completed at:** ${new Date(ex.completedAt).toLocaleTimeString()}`);
+        lines.push('');
+      });
+    }
+
+    lines.push('---');
+    lines.push('');
+
+    // ===== SCOOP DETAIL =====
+    lines.push('## Scoop (Stage 1 → Stage 2 bridge)');
+    lines.push('');
+
+    if (!summary.scoopDeployed) {
+      lines.push('*Scoop not yet deployed in this session.*');
+      lines.push('');
+    } else {
+      const parrotList = excuses.map(e => e.chipLabel.toLowerCase()).join(', ');
+      lines.push(`- **Excuses parroted back to prospect:** ${parrotList}`);
+      lines.push(`- **Override used:** ${summary.scoopOverride ? 'Yes' : 'No'}`);
+      lines.push('');
+      if (namedFear) {
+        lines.push('**Named fear (verbatim):**');
+        lines.push('');
+        lines.push(`> "${namedFear.text}"`);
+        lines.push('');
+        lines.push(`*Drawn from Type ${namedFear.type} fear samples in lexicon.*`);
+        lines.push('');
+      }
+      lines.push(`- **Aha type:** ${ahaType || '(not marked)'}`);
+      if (ahaType === 'somatic') {
+        lines.push(`  - ✓ Holy-shit moment achieved. Earned Stage 2.`);
+      } else if (ahaType === 'intellectual') {
+        lines.push(`  - ⚠ Named but no weight. Need to re-deploy and dig deeper.`);
+      }
+      lines.push('');
+    }
+
+    lines.push('---');
+    lines.push('');
+
+    // ===== STAGE 2 PLACEHOLDER =====
+    lines.push('## Stage 2 — Cost, consequence, future-self, let go');
+    lines.push('');
+    lines.push('*Not yet executed in this sim. Stage 2 happens outside the sim, in real conversation.*');
+    lines.push('');
+    lines.push('### To execute next:');
+    lines.push('');
+    lines.push('1. **Past cost of the fear** — "How long has this fear been controlling how you operate? What has it already cost you?"');
+    lines.push('2. **Future consequence** — "If this fear keeps running the show for 3-5 more years, where does that put you?"');
+    lines.push('3. **Visualize future self** — "Imagine the version of you who has moved through this. What\'s different?"');
+    lines.push('4. **"What do we need to let go of?"** — only after all above');
+    lines.push('');
+    lines.push('---');
+    lines.push('');
+
+    // ===== AI CONVERSATION TRANSCRIPT (if AI mode was used) =====
+    if (typeof ConversationHistory !== 'undefined' && ConversationHistory.getLength() > 0) {
+      if (persona) {
+        lines.push('## Prospect persona');
+        lines.push('');
+        lines.push('- **Name:** ' + persona.name);
+        lines.push('- **Age:** ' + persona.age);
+        lines.push('- **Business:** ' + persona.business);
+        lines.push('- **Type:** ' + persona.type);
+        lines.push('- **Background:** ' + persona.background);
+        if (persona.realMotivation) lines.push('- **Real motivation:** ' + persona.realMotivation);
+        if (persona.hiddenFear) lines.push('- **Hidden fear:** ' + persona.hiddenFear);
+        if (persona.raw) {
+          lines.push('');
+          lines.push('**Brief you provided:**');
+          lines.push('');
+          lines.push('> ' + persona.raw.replace(/\n/g, '\n> '));
+        }
+        lines.push('');
+        lines.push('---');
+        lines.push('');
+      }
+
+      // Filter out hidden seed turns
+      const visibleTurns = ConversationHistory.getAll().filter(t => !(t.meta && t.meta.hidden));
+
+      lines.push('## Full conversation transcript');
+      lines.push('');
+      lines.push('*' + visibleTurns.length + ' visible turns · AI played ' + (aiPlays === 'closer' ? 'the closer' : 'the prospect') + '*');
+      lines.push('');
+
+      // Role-aware labels
+      const userLabel = aiPlays === 'closer'
+        ? 'You as ' + (persona ? persona.name : 'prospect')
+        : 'You (closer)';
+      const aiLabel = aiPlays === 'closer'
+        ? 'Coach (AI)'
+        : (persona ? persona.name + ' (AI)' : 'Prospect (AI)');
+
+      visibleTurns.forEach(turn => {
+        const speaker = turn.role === 'user' ? userLabel : aiLabel;
+        const time = new Date(turn.timestamp).toLocaleTimeString();
+        lines.push('**' + speaker + '** · ' + time);
+        if (turn.meta && turn.meta.regenerated) lines.push('*(regenerated)*');
+        lines.push('');
+        const formattedContent = turn.content.split('\n').map(line => '> ' + line).join('\n');
+        lines.push(formattedContent);
+        lines.push('');
+      });
+      lines.push('---');
+      lines.push('');
+    }
+
+    // ===== REVIEW NOTES (empty section for you to add later) =====
+    lines.push('## Your review notes');
+    lines.push('');
+    lines.push('*(Add what you observed, what worked, what to adjust.)*');
+    lines.push('');
+    lines.push('---');
+    lines.push('');
+    lines.push('*End of session report.*');
+    lines.push('');
+
+    return lines.join('\n');
+  }
+
+  return {
+    autoSave,
+    loadAutoSaved,
+    clearAutoSaved,
+    hasAutoSaved,
+    archiveCompletedSession,
+    getHistory,
+    exportAsMarkdown,
+    buildMarkdownReport // exposed for testing
+  };
+})();
